@@ -158,6 +158,21 @@ class OperatorPool:
             if not np.isclose(fop_ab.induced_norm(), 0):
                 self.op_pool.append(fop_ab)
 
+    def two_body_alpha_beta_block(self):
+        """
+        Doubles generators each with distinct Sz expectation value.
+
+        G^{isigma, jtau, ktau, lsigma) for sigma, tau in 0, 1
+        """
+        for i, j, k, l in product(range(self.norbs), repeat=4):
+            op_ab = ((2 * i, 1), (2 * j + 1, 1), (2 * k + 1, 0), (2 * l, 0))
+            fop_ab = of.FermionOperator(op_ab)
+            fop_ab = fop_ab - of.hermitian_conjugated(fop_ab)
+            fop_ab = of.normal_ordered(fop_ab)
+            if not np.isclose(fop_ab.induced_norm(), 0):
+                self.op_pool.append(fop_ab)
+
+
     def one_body_sz_adapted(self):
         # alpha-alpha rotation
         # beta-beta rotation

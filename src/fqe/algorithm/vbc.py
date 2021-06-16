@@ -43,6 +43,8 @@ from fqe.algorithm.generalized_doubles_factorization import \
 from fqe.algorithm.low_rank import evolve_fqe_charge_charge_unrestricted, \
     evolve_fqe_givens_unrestricted
 
+from uthc.takagi_spin_adapted import TwoBodySOSEvolution
+
 
 def valdemaro_reconstruction_functional(tpdm, n_electrons, true_opdm=None):
     """
@@ -82,10 +84,10 @@ class SumOfSquaresOperator:
         self.one_body_rotation = one_body_rotation
         self.one_body_generator = one_body_generator
 
-    def time_evolve(self, wf):
+    def time_evolve(self, wf, coeff):
         for v, cc in zip(self.basis_rotation, self.charge_charge):
             wf = evolve_fqe_givens_unrestricted(wf, v.conj().T)
-            wf = evolve_fqe_charge_charge_unrestricted(wf, cc)
+            wf = evolve_fqe_charge_charge_unrestricted(wf, cc * coeff)
             wf = evolve_fqe_givens_unrestricted(wf, v)
         wf = evolve_fqe_givens_unrestricted(wf, self.one_body_rotation)
         return wf
@@ -196,43 +198,90 @@ class VBC:
         return sos_op
 
     def get_takagi_tensor_decomp(self, residual, update_utc):
-        one_body_residual = -np.einsum('pqrq->pr', residual)
-        if not np.isclose(np.linalg.norm(one_body_residual), 0):
-            # enforce symmetry in one-body sector
-            one_body_residual[::2, ::2] = 0.5 * \
-                                          (one_body_residual[::2,
-                                           ::2] + one_body_residual[
-                                                  1::2, 1::2])
-            one_body_residual[1::2, 1::2] = one_body_residual[::2, ::2]
+        return TwoBodySOSEvolution(generalized_doubles=residual,
+                                   alpha_doubles=residual[::2, ::2, ::2, ::2],
+                                   beta_doubles=residual[1::2, 1::2, 1::2, 1::2],
+                                   alpha_beta_doubles=residual[::2, 1::2, 1::2, ::2])
 
-        Zlp, Zlm, _, one_body_residual = doubles_factorization_takagi(residual)
+    def get_takagi_tensor_decomp_ab(self, residual, update_utc, eig_cutoff=None):
+        nso = residual.shape[0]
+        ab_tensor = np.zeros((nso, nso, nso, nso), dtype=residual.dtype)
+        ab_tensor[::2, 1::2, 1::2, ::2] = residual[::2, 1::2, 1::2, ::2]
+        ab_tensor[1::2, ::2, ::2, 1::2] = residual[1::2, ::2, ::2, 1::2]
+        assert np.allclose(np.transpose(residual, [1, 0, 3, 2]),
+                           np.einsum('ijkl->jilk', residual))
 
-        basis_list = []
-        cc_list = []
-        if update_utc is None:
-            update_utc = len(Zlp)
+        Zlp, Zlm, Zl, obr = \
+            doubles_factorization_takagi(ab_tensor, eig_cutoff=eig_cutoff)
+        if not np.allclose(obr, 0):
+            raise SpinError(
+                "the one-body term should be zero for a-b evolution")
 
-        for ll in range(update_utc):
+        Zlp_a = []
+        Zlm_a = []
+        Zlp_b = []
+        Zlm_b = []
+        plus_basis: List[Tuple] = []
+        plus_nn: List[np.ndarray] = []
+        minus_basis: List[Tuple] = []
+        minus_nn: List[np.ndarray] = []
+        for ll in range(len(Zlp)):
+            Zlp_a.append(Zl[ll][::2, ::2] + 1j * Zl[ll][::2, ::2].conj().T)
+            Zlm_a.append(Zl[ll][::2, ::2] - 1j * Zl[ll][::2, ::2].conj().T)
+            Zlp_b.append(Zl[ll][1::2, 1::2] + 1j * Zl[ll][1::2, 1::2].conj().T)
+            Zlm_b.append(Zl[ll][1::2, 1::2] - 1j * Zl[ll][1::2, 1::2].conj().T)
+
+            assert np.isclose(np.linalg.norm(Zl[ll][::2, 1::2]), 0)
+            assert np.isclose(np.linalg.norm(Zl[ll][1::2, ::2]), 0)
+            assert np.isclose(np.linalg.norm(Zlp[ll][::2, 1::2]), 0)
+            assert np.isclose(np.linalg.norm(Zlp[ll][1::2, ::2]), 0)
+            assert np.isclose(np.linalg.norm(Zlm[ll][::2, 1::2]), 0)
+            assert np.isclose(np.linalg.norm(Zlm[ll][1::2, ::2]), 0)
+
+            # the above assertions indicates that the alpha-beta blocks of Zlp and
+            # Zlm are zero and thus a diagonalizing unitary will not couple the
+            # alpha-spin orbital sectors and beta-spin orbital sectors.
+            # thus we can diagonalize each separately and the oww will be the
+            # outer product of both eigenvalues corresponding to n_{ia}n_{jb}
+            # coefficients. We should be able to exactly recover the
+            # full Zlm Zlp representations
+
             op1mat = Zlp[ll]
             op2mat = Zlm[ll]
-            w1, v1 = sp.linalg.schur(op1mat)
-            w1 = np.diagonal(w1)
+            op1mat_a = Zlp[ll][::2, ::2]
+            op1mat_b = Zlp[ll][1::2, 1::2]
 
-            w2, v2 = sp.linalg.schur(op2mat)
-            w2 = np.diagonal(w2)
-            oww1 = np.outer(w1, w1)
-            oww2 = np.outer(w2, w2)
+            w1_a, v1_a = sp.linalg.schur(op1mat_a)
+            w1_a = np.diagonal(w1_a)
+            w1_b, v1_b = sp.linalg.schur(op1mat_b)
+            w1_b = np.diagonal(w1_b)
 
-            basis_list.append(v1)
-            cc_list.append((-1 / 4) * oww1.imag)
+            op2mat_a = Zlm[ll][::2, ::2]
+            op2mat_b = Zlm[ll][1::2, 1::2]
+            w2_a, v2_a = sp.linalg.schur(op2mat_a)
+            w2_a = np.diagonal(w2_a)
+            w2_b, v2_b = sp.linalg.schur(op2mat_b)
+            w2_b = np.diagonal(w2_b)
 
-            basis_list.append(v2)
-            cc_list.append((-1 / 4) * oww2.imag)
+            assert np.allclose(np.einsum('pj,j,qj', v1_a, w1_a, v1_a.conj()),
+                               op1mat[::2, ::2])
+            assert np.allclose(np.einsum('pj,j,qj', v1_b, w1_b, v1_b.conj()),
+                               op1mat[1::2, 1::2])
+            assert np.allclose(np.einsum('pj,j,qj', v2_a, w2_a, v2_a.conj()),
+                               op2mat[::2, ::2])
+            assert np.allclose(np.einsum('pj,j,qj', v2_b, w2_b, v2_b.conj()),
+                               op2mat[1::2, 1::2])
 
-        sos_op = SumOfSquaresOperator(basis_rotation=basis_list,
-                                      charge_charge_matrix=cc_list,
-                                      sdim=self.sdim,
-                                      one_body_rotation=expm(one_body_residual))
+            plus_basis.append((v1_a, v1_b))
+            plus_nn.append(-0.25 * np.outer(w1_a, w1_b).imag)
+            minus_basis.append((v2_a, v2_b))
+            minus_nn.append(-0.25 * np.outer(w2_a, w2_b).imag)
+
+        sos_op = SumOfSquaresOperatorAB(plus_basis=plus_basis,
+                                        minus_basis=minus_basis,
+                                        plus_nn=plus_nn,
+                                        minus_nn=minus_nn)
+
         return sos_op
 
     def vbc(self,
@@ -263,9 +312,9 @@ class VBC:
             opt_options = {}
         self.num_opt_var = num_opt_var
         nso = 2 * self.sdim
-        operator_pool: List[Union[ABCHamiltonian, SumOfSquaresOperator]] = []
+        operator_pool: List[Union[ABCHamiltonian, SumOfSquaresOperator, TwoBodySOSEvolution]] = []
         operator_pool_fqe: List[
-            Union[ABCHamiltonian, SumOfSquaresOperator]] = []
+            Union[ABCHamiltonian, SumOfSquaresOperator, SumOfSquaresOperator, TwoBodySOSEvolution]] = []
         existing_parameters: List[float] = []
         self.energies = []
         self.energies = [initial_wf.expectationValue(self.k2_fop)]
@@ -279,14 +328,11 @@ class VBC:
                     continue
                 if isinstance(op, ABCHamiltonian):
                     wf = wf.time_evolve(coeff, op)
-                elif isinstance(op, SumOfSquaresOperator):
-                    for v, cc in zip(op.basis_rotation, op.charge_charge):
-                        wf = evolve_fqe_givens_unrestricted(wf, v.conj().T)
-                        wf = evolve_fqe_charge_charge_unrestricted(
-                            wf, coeff * cc)
-                        wf = evolve_fqe_givens_unrestricted(wf, v)
-                    wf = evolve_fqe_givens_unrestricted(wf,
-                                                        op.one_body_rotation)
+                elif isinstance(op, (SumOfSquaresOperator, TwoBodySOSEvolution)):
+                    if isinstance(op, SumOfSquaresOperator):
+                        wf = op.time_evolve(wf)
+                    elif isinstance(op, TwoBodySOSEvolution):
+                        wf = op.evolve_ab(wf)
                 else:
                     raise ValueError("Can't evolve operator type {}".format(
                         type(op)))
@@ -323,7 +369,7 @@ class VBC:
             fqe_ops: List[Union[ABCHamiltonian, SumOfSquaresOperator]] = []
             if isinstance(fop, ABCHamiltonian):
                 fqe_ops.append(fop)
-            elif isinstance(fop, SumOfSquaresOperator):
+            elif isinstance(fop, (SumOfSquaresOperator, TwoBodySOSEvolution)):
                 fqe_ops.append(fop)
             else:
                 fqe_ops.append(
@@ -331,7 +377,7 @@ class VBC:
                                       conserve_number=True))
 
             operator_pool_fqe.extend(fqe_ops)
-            existing_parameters.extend([0])
+            existing_parameters.extend([np.random.randn()])
 
             if self.num_opt_var is not None:
                 if len(operator_pool_fqe) < self.num_opt_var:
@@ -346,11 +392,6 @@ class VBC:
                             operator_pool_fqe[:-self.num_opt_var],
                             existing_parameters[:-self.num_opt_var]):
                         current_wf = current_wf.time_evolve(coeff, fqe_op)
-                    temp_cwf = copy.deepcopy(current_wf)
-                    for fqe_op, coeff in zip(pool_to_op, params_to_op):
-                        if np.isclose(coeff, 0):
-                            continue
-                        temp_cwf = temp_cwf.time_evolve(coeff, fqe_op)
 
                 new_parameters, current_e = self.optimize_param(
                     pool_to_op,
@@ -384,6 +425,52 @@ class VBC:
                 break
             iteration += 1
 
+    def optimize_param_fd(
+            self,
+            pool: Union[List[of.FermionOperator], List[ABCHamiltonian]],
+            existing_params: Union[List, np.ndarray],
+            initial_wf: Wavefunction,
+            opt_method: str,
+            opt_options=None) -> Tuple[np.ndarray, float]:
+        """Optimize a wavefunction given a list of generators
+
+        Args:
+            pool: generators of rotation
+            existing_params: parameters for the generators
+            initial_wf: initial wavefunction
+            opt_method: Scpy.optimize method
+        """
+        if opt_options is None:
+            opt_options = {}
+
+        def cost_func(params):
+            assert len(params) == len(pool)
+            # compute wf for function call
+            wf = copy.deepcopy(initial_wf)
+            for op, coeff in zip(pool, params):
+                if np.isclose(coeff, 0):
+                    continue
+                if isinstance(op, ABCHamiltonian):
+                    wf = wf.time_evolve(coeff, op)
+                elif isinstance(op, SumOfSquaresOperator):
+                    wf = op.time_evolve(wf, coeff)
+                elif isinstance(op, TwoBodySOSEvolution):
+                    wf = op.evolve_ab(wf, coeff)
+                else:
+                    raise ValueError("Can't evolve operator type {}".format(
+                        type(fqe_op)))
+
+            eval = wf.expectationValue(self.k2_fop).real
+            print(eval)
+            return eval
+
+        res = sp.optimize.minimize(cost_func,
+                                   existing_params,
+                                   method=opt_method,
+                                   jac=False,
+                                   options=opt_options)
+        return res.x, res.fun
+
     def optimize_param(
             self,
             pool: Union[List[of.FermionOperator], List[ABCHamiltonian]],
@@ -412,13 +499,9 @@ class VBC:
                 if isinstance(op, ABCHamiltonian):
                     wf = wf.time_evolve(coeff, op)
                 elif isinstance(op, SumOfSquaresOperator):
-                    for v, cc in zip(op.basis_rotation, op.charge_charge):
-                        wf = evolve_fqe_givens_unrestricted(wf, v.conj().T)
-                        wf = evolve_fqe_charge_charge_unrestricted(
-                            wf, coeff * cc)
-                        wf = evolve_fqe_givens_unrestricted(wf, v)
-                    wf = evolve_fqe_givens_unrestricted(wf,
-                                                        op.one_body_rotation)
+                    wf = op.time_evolve(wf, coeff)
+                elif isinstance(op, TwoBodySOSEvolution):
+                    wf = op.evolve_ab(wf, coeff)
                 else:
                     raise ValueError("Can't evolve operator type {}".format(
                         type(fqe_op)))
@@ -434,6 +517,10 @@ class VBC:
                     for gidx, (op, coeff) in enumerate(zip(pool, params)):
                         if isinstance(op, ABCHamiltonian):
                             fqe_op = op
+                        elif isinstance(op, SumOfSquaresOperator):
+                            pass
+                        elif isinstance(op, TwoBodySOSEvolution):
+                            pass
                         else:
                             fqe_op = build_hamiltonian(1j * op,
                                                        self.sdim,
@@ -454,9 +541,72 @@ class VBC:
             return (wf.expectationValue(self.k2_fop).real,
                     np.array(grad_vec.real, order='F'))
 
-        res = sp.optimize.minimize(cost_func,
+        def cost_func_parallel(params):
+            assert len(params) == len(pool)
+            # compute wf for function call
+            wf = copy.deepcopy(initial_wf)
+            for op, coeff in zip(pool, params):
+                if np.isclose(coeff, 0):
+                    continue
+                if isinstance(op, ABCHamiltonian):
+                    wf = wf.time_evolve(coeff, op)
+                elif isinstance(op, SumOfSquaresOperator):
+                    wf = op.time_evolve(wf, coeff)
+                elif isinstance(op, TwoBodySOSEvolution):
+                    wf = op.evolve_ab(wf, coeff)
+                else:
+                    raise ValueError("Can't evolve operator type {}".format(
+                        type(fqe_op)))
+
+            # compute gradients
+            grad_vec = np.zeros(len(params), dtype=np.complex128)
+            from joblib import delayed, Parallel
+            # avoid extra gradient computation if we can
+            if opt_method not in ['Nelder-Mead', 'COBYLA']:
+                grad_wf = copy.deepcopy(initial_wf)
+                with Parallel(n_jobs=-1, backend='loky') as parallel:
+                    res = parallel(
+                        delayed(atomic_grad_calculation)(xx, params, pool,
+                                                         copy.deepcopy(grad_wf),
+                                                         self.k2_fop, wf) for xx
+                        in range(len(params)))
+                    for ii, val in res:
+                        grad_vec[ii] = val
+            return (wf.expectationValue(self.k2_fop).real,
+                    np.array(grad_vec.real, order='F'))
+
+        res = sp.optimize.minimize(cost_func_parallel,
                                    existing_params,
                                    method=opt_method,
                                    jac=True,
                                    options=opt_options)
         return res.x, res.fun
+
+
+
+def atomic_grad_calculation(pidx, params, pool, grad_wf, k2_fop, brawfn):
+    for gidx, (op, coeff) in enumerate(zip(pool, params)):
+        if isinstance(op, ABCHamiltonian):
+            fqe_op = op
+        elif isinstance(op, SumOfSquaresOperator):
+            pass
+        elif isinstance(op, TwoBodySOSEvolution):
+            pass
+        else:
+            fqe_op = build_hamiltonian(1j * op,
+                                       self.sdim,
+                                       conserve_number=True)
+        if not np.isclose(coeff, 0):
+            grad_wf = grad_wf.time_evolve(coeff, fqe_op)
+            # if looking at the pth parameter then apply the
+            # operator to the state
+        if gidx == pidx:
+            grad_wf = grad_wf.apply(fqe_op)
+
+    # grad_val = grad_wf.expectationValue(self.elec_hamil,
+    # brawfn=wf)
+    grad_val = grad_wf.expectationValue(k2_fop, brawfn=brawfn)
+
+    returned_gval = -1j * grad_val + 1j * grad_val.conj()
+    assert np.isclose(returned_gval.imag, 0)
+    return (pidx, returned_gval.real)
