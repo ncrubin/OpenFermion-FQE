@@ -316,7 +316,6 @@ class VBC:
         operator_pool_fqe: List[
             Union[ABCHamiltonian, SumOfSquaresOperator, SumOfSquaresOperator, TwoBodySOSEvolution]] = []
         existing_parameters: List[float] = []
-        self.energies = []
         self.energies = [initial_wf.expectationValue(self.k2_fop)]
         self.residuals = []
         iteration = 0
@@ -420,6 +419,11 @@ class VBC:
                     len(existing_parameters)))
             self.energies.append(current_e)
             self.residuals.append(acse_residual)
+
+            np.save("two_body_residuals", np.array(self.residuals))
+            np.save("energies", np.array(self.energies))
+            np.save("parameters", np.array(existing_parameters))
+
             if np.max(np.abs(acse_residual)) < self.stopping_eps or np.abs(
                     self.energies[-2] - self.energies[-1]) < self.delta_e_eps:
                 break
