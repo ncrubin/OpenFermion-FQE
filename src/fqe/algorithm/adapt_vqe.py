@@ -189,6 +189,16 @@ class OperatorPool:
                 self.op_pool.append(fop_aa)
                 self.op_pool.append(fop_bb)
 
+    def one_body_general(self):
+        # alpha-alpha rotation
+        for i, j in product(range(2 * self.norbs), repeat=2):
+            if i > j:
+                op_aa = ((i, 1), (j, 0))
+                fop_aa = of.FermionOperator(op_aa)
+                fop_aa = fop_aa - of.hermitian_conjugated(fop_aa)
+                self.op_pool.append(fop_aa)
+
+
 
 class ADAPT:
 
@@ -427,6 +437,7 @@ class ADAPT:
 
                     grad_vec[pidx] = -1j * grad_val + 1j * grad_val.conj()
                     assert np.isclose(grad_vec[pidx].imag, 0)
+
             return (wf.expectationValue(self.k2_fop).real,
                     np.array(grad_vec.real, order='F'))
 

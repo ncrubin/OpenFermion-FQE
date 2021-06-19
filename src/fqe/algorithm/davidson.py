@@ -18,12 +18,14 @@ import copy
 import time
 
 import numpy as np
+import scipy as sp
 
 import openfermion as of
 import fqe
 from fqe.unittest_data.build_lih_data import build_lih_data
 from fqe.hamiltonians.hamiltonian import Hamiltonian
 
+from fqe.fqe_ops.fqe_ops import S2Operator
 
 class ConvergenceError(Exception):
     """Error for failed convergence in Davidson-Liu diagonalization."""
@@ -146,6 +148,7 @@ def davidsonliu_fqe(
         norb,
         epsilon: float = 1.0e-8,
         verbose=False,
+        ss_shift=None
 ):
     """TODO: Add docstring."""
     if nroots < 1 or nroots > 2**(hmat.dim() - 1):
@@ -180,6 +183,7 @@ def davidsonliu_fqe(
                              hmat).real
 
     old_thetas = np.array([np.infty] * nroots)
+    converged_roots_and_eigs = []
     while len(guess_vecs) <= graph.lena() * graph.lenb() / 2:
         if verbose:
             print()
@@ -187,50 +191,40 @@ def davidsonliu_fqe(
         start_time = time.time()
         subspace_mat = np.zeros((len(guess_vecs), len(guess_vecs)),
                                 dtype=np.complex128)
+        subspace_ovlp = np.zeros((len(guess_vecs), len(guess_vecs)),
+                                dtype=np.complex128)
+        ss_vals = []
         for i, j in product(range(len(guess_vecs)), repeat=2):
             if i >= j:
                 subspace_mat[i, j] = guess_vecs[j].expectationValue(
                     hmat, brawfn=guess_vecs[i])
+                subspace_ovlp[i, j] = fqe.vdot(guess_vecs[j], guess_vecs[i])
             subspace_mat[j, i] = subspace_mat[i, j]
+            subspace_ovlp[j, i] = subspace_ovlp[i, j]
+            if i == j and ss_shift is not None:
+                s2_op = S2Operator()
+                s2_val = s2_op.contract(guess_vecs[i], guess_vecs[i])
+                ss_vals.append(s2_val)
+
+
         if verbose:
             print("subspace mat problem formation ", time.time() - start_time)
 
         # for nroots residuals
         start_time = time.time()
-        w, v = np.linalg.eigh(subspace_mat)
+
+        if ss_shift is not None:
+            w, v = sp.linalg.eigh(subspace_mat + np.diag((np.array(ss_vals) - ss_shift)**2), b=subspace_ovlp)
+        else:
+            w, v = sp.linalg.eigh(subspace_mat, b=subspace_ovlp)
+
+        assert np.allclose(v.T @ subspace_ovlp @ v, np.eye(len(guess_vecs)))
         if verbose:
             print("subsapce eig problem time: ", time.time() - start_time)
 
-        # if converged return
-        if verbose:
-            print(
-                "eig convergence  {}, ".format(
-                    np.linalg.norm(w[:nroots] - old_thetas)),
-                w[:nroots] - old_thetas,
-            )
-        if np.linalg.norm(w[:nroots] - old_thetas) < epsilon:
-            # build eigenvectors
-            eigenvectors = []
-            for i in range(nroots):
-                eigenvectors.append(
-                    sum([
-                        v[j, i] * guess_vecs[j].sector(gv_sector).coeff
-                        for j in range(current_num_gv)
-                    ]))
-            eigfuncs = []
-            for eg in eigenvectors:
-                new_wfn = copy.deepcopy(guess_vecs[0])
-                new_wfn.set_wfn(strategy='from_data', raw_data={gv_sector: eg})
-                eigfuncs.append(new_wfn)
-
-            return w[:nroots], eigfuncs
-
-        # else set new roots to the old roots
-        old_thetas = w[:nroots]
-        if verbose:
-            print("Old Thetas: ", old_thetas)
-        # update the subspace vecs with the vecs of the subspace problem with
-        # the nroots lowest eigenvalues
+        # form Ritz approximation to nroots
+        residual_norms = []
+        converged_roots_and_eigs = []
         for i in range(nroots):
             # expand in the space of all existing guess_vecs
             subspace_eigvec_expanded = sum([
@@ -242,57 +236,60 @@ def davidsonliu_fqe(
                 strategy="from_data",
                 raw_data={gv_sector: subspace_eigvec_expanded},
             )
-            # this should return a fresh wavefunction copy.deepcop
+
+            # # this should return a fresh wavefunction copy.deepcop
             residual = subspace_eigvec.apply(hmat)
             subspace_eigvec.scale(-w[i])
             residual = residual + subspace_eigvec
+            residual_norms.append(residual.norm())
 
-            preconditioner = copy.deepcopy(residual)
-            preconditioner.set_wfn(
-                strategy="from_data",
-                raw_data={gv_sector: np.reciprocal(w[i] - diagonal_ham)},
-            )
-            f_k_coeffs = np.multiply(
-                preconditioner.sector(gv_sector).coeff,
-                residual.sector(gv_sector).coeff,
-            )
-            f_k = copy.deepcopy(residual)
-            f_k.set_wfn(strategy="from_data", raw_data={gv_sector: f_k_coeffs})
+            # # check if residual is converged. If so add it to results
+            if residual_norms[-1] < epsilon:
+                converged_roots_and_eigs.append((w[i], subspace_eigvec))
+                print("converged root {: 5.15f}".format(w[i]))
+            else:
+                # if not converged get new vector to add to subspace.
 
-            # orthogonalize preconditioned_residual
-            overlaps = []
-            # print(len(guess_vecs))
-            for idx in range(len(guess_vecs)):
-                overlaps.append(
-                    np.sum(
-                        np.multiply(
-                            guess_vecs[idx].get_coeff(gv_sector),
-                            f_k.get_coeff(gv_sector),
-                        )))
+                # preconditioner correction vector
+                preconditioner = copy.deepcopy(residual)
+                a = np.ones_like(diagonal_ham)
+                b = w[i] - diagonal_ham
+                b = b.real
+                recp = np.divide(a, b, out=np.zeros_like(a), where=b!=0)
+                preconditioner.set_wfn(
+                    strategy="from_data",
+                    raw_data={gv_sector: recp},
+                )
+                f_k_coeffs = np.multiply(
+                    preconditioner.sector(gv_sector).coeff,
+                    residual.sector(gv_sector).coeff,
+                )
+                f_k = copy.deepcopy(residual)
+                f_k.set_wfn(strategy="from_data", raw_data={gv_sector: f_k_coeffs})
 
-    for idx in range(len(guess_vecs)):
-        f_k.sector(gv_sector).coeff -= (overlaps[idx] *
-                                        guess_vecs[idx].sector(gv_sector).coeff)
+                # # orthogonalize preconditioned_residual
+                overlaps = []
+                # print(len(guess_vecs))
+                for idx in range(len(guess_vecs)):
+                    overlaps.append(fqe.vdot(guess_vecs[idx], f_k))
+                for idx in range(len(guess_vecs)):
+                    f_k.sector(gv_sector).coeff -= (overlaps[idx] *
+                                                    guess_vecs[idx].sector(
+                                                        gv_sector).coeff)
 
-    f_k.normalize()
-    guess_vecs.append(f_k)
+                f_k.normalize()
+                guess_vecs.append(f_k)
+        print("Norm of residuals")
+        print(residual_norms)
+        print("Current lowest roots")
+        print(w[:nroots])
+        if len(np.where(np.array(residual_norms) < epsilon)[0]) == len(residual_norms):
+            return converged_roots_and_eigs
 
-    eigenvectors = []
-    for i in range(nroots):
-        eigenvectors.append(
-            sum([
-                v[j, i] * guess_vecs[j].sector(gv_sector).coeff
-                for j in range(current_num_gv)
-            ]))
-    eigfuncs = []
-    for eg in eigenvectors:
-        new_wfn = copy.deepcopy(guess_vecs[0])
-        new_wfn.set_wfn(strategy='from_data', raw_data={gv_sector: eg})
-        eigfuncs.append(new_wfn)
+    raise ConvergenceError
 
-    return w[:nroots], eigfuncs
 
-    # raise ConvergenceError("Maximal number of steps exceeded")
+
 
 
 def davidson_diagonalization(
