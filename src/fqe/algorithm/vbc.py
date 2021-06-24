@@ -198,10 +198,38 @@ class VBC:
         return sos_op
 
     def get_takagi_tensor_decomp(self, residual, update_utc):
-        return TwoBodySOSEvolution(generalized_doubles=residual,
-                                   alpha_doubles=residual[::2, ::2, ::2, ::2],
-                                   beta_doubles=residual[1::2, 1::2, 1::2, 1::2],
-                                   alpha_beta_doubles=residual[::2, 1::2, 1::2, ::2])
+        # return TwoBodySOSEvolution(generalized_doubles=residual,
+        #                            alpha_doubles=residual[::2, ::2, ::2, ::2],
+        #                            beta_doubles=residual[1::2, 1::2, 1::2, 1::2],
+        #                            alpha_beta_doubles=residual[::2, 1::2, 1::2, ::2])
+        from uthc.takagi_spin_adapted import sos_takagi_ab_sector, \
+            sos_takagi_single_sector
+
+        plus_basis, plus_nn, minus_basis, minus_nn = \
+            sos_takagi_ab_sector(residual[::2, 1::2, 1::2, ::2])
+        nso = residual.shape[0]
+        ops_to_return = []
+        for ll in range(len(plus_basis)):
+            v1_a, v1_b = plus_basis[ll]
+            oww1ab = -1j * plus_nn[ll]
+            v2_a, v2_b = minus_basis[ll]
+            oww2ab = -1j * minus_nn[ll]
+            # ab-part
+            # temp_gen = np.einsum('pi,si,ij,qj,rj->pqrs', v1_a, v1_a.conj(),
+            #                      oww1ab, v1_b, v1_b.conj())
+            # temp_gen += np.einsum('pi,si,ij,qj,rj->pqrs', v2_a, v2_a.conj(),
+            #                       oww2ab, v2_b, v2_b.conj())
+            temp_gen = np.einsum('iP,iQ,ij,jR,jS->PRSQ', v1_a.T, v1_a.conj().T,
+                                 oww1ab, v1_b.T, v1_b.conj().T)
+            # test_tensor[::2, 1::2, 1::2, ::2] += temp_gen
+            t2_op = of.FermionOperator()
+            for p, q, r, s in product(range(nso), repeat=4):
+                t2_op += of.FermionOperator(((p, 1), (q, 1), (r, 0), (s, 0)),
+                                            coefficient=temp_gen[p//2, q//2, r//2, s//2])
+            ops_to_return.append(t2_op - of.hermitian_conjugated(t2_op))
+        return ops_to_return
+            # fqe_op = fqe.build_hamiltonian(2j * t2_op, norb=molecule.n_orbitals)
+
 
     def get_takagi_tensor_decomp_ab(self, residual, update_utc, eig_cutoff=None):
         nso = residual.shape[0]
@@ -360,6 +388,7 @@ class VBC:
             elif generator_decomp is 'takagi':
                 fop = self.get_takagi_tensor_decomp(acse_residual,
                                                     generator_rank)
+                fop = fop[0]
             else:
                 raise ValueError(
                     "Generator decomp must be None, svd, or takagi")
@@ -376,7 +405,7 @@ class VBC:
                                       conserve_number=True))
 
             operator_pool_fqe.extend(fqe_ops)
-            existing_parameters.extend([np.random.randn()])
+            existing_parameters.extend([0])
 
             if self.num_opt_var is not None:
                 if len(operator_pool_fqe) < self.num_opt_var:
@@ -579,7 +608,7 @@ class VBC:
             return (wf.expectationValue(self.k2_fop).real,
                     np.array(grad_vec.real, order='F'))
 
-        res = sp.optimize.minimize(cost_func_parallel,
+        res = sp.optimize.minimize(cost_func,
                                    existing_params,
                                    method=opt_method,
                                    jac=True,

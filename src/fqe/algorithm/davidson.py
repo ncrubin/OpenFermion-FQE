@@ -218,7 +218,8 @@ def davidsonliu_fqe(
         else:
             w, v = sp.linalg.eigh(subspace_mat, b=subspace_ovlp)
 
-        assert np.allclose(v.T @ subspace_ovlp @ v, np.eye(len(guess_vecs)))
+        # assert np.allclose(v.T @ subspace_ovlp @ v, np.eye(len(guess_vecs)))
+
         if verbose:
             print("subsapce eig problem time: ", time.time() - start_time)
 
@@ -243,42 +244,42 @@ def davidsonliu_fqe(
             residual = residual + subspace_eigvec
             residual_norms.append(residual.norm())
 
-            # # check if residual is converged. If so add it to results
-            if residual_norms[-1] < epsilon:
-                converged_roots_and_eigs.append((w[i], subspace_eigvec))
-                print("converged root {: 5.15f}".format(w[i]))
-            else:
-                # if not converged get new vector to add to subspace.
+            # # # check if residual is converged. If so add it to results
+            # if residual_norms[-1] < epsilon:
+            #     converged_roots_and_eigs.append((w[i], subspace_eigvec))
+            #     print("converged root {: 5.15f}".format(w[i]))
+            # else:
+            # if not converged get new vector to add to subspace.
 
-                # preconditioner correction vector
-                preconditioner = copy.deepcopy(residual)
-                a = np.ones_like(diagonal_ham)
-                b = w[i] - diagonal_ham
-                b = b.real
-                recp = np.divide(a, b, out=np.zeros_like(a), where=b!=0)
-                preconditioner.set_wfn(
-                    strategy="from_data",
-                    raw_data={gv_sector: recp},
-                )
-                f_k_coeffs = np.multiply(
-                    preconditioner.sector(gv_sector).coeff,
-                    residual.sector(gv_sector).coeff,
-                )
-                f_k = copy.deepcopy(residual)
-                f_k.set_wfn(strategy="from_data", raw_data={gv_sector: f_k_coeffs})
+            # preconditioner correction vector
+            preconditioner = copy.deepcopy(residual)
+            a = np.ones_like(diagonal_ham)
+            b = w[i] - diagonal_ham
+            b = b.real
+            recp = np.divide(a, b, out=np.zeros_like(a), where=b!=0)
+            preconditioner.set_wfn(
+                strategy="from_data",
+                raw_data={gv_sector: recp},
+            )
+            f_k_coeffs = np.multiply(
+                preconditioner.sector(gv_sector).coeff,
+                residual.sector(gv_sector).coeff,
+            )
+            f_k = copy.deepcopy(residual)
+            f_k.set_wfn(strategy="from_data", raw_data={gv_sector: f_k_coeffs})
 
-                # # orthogonalize preconditioned_residual
-                overlaps = []
-                # print(len(guess_vecs))
-                for idx in range(len(guess_vecs)):
-                    overlaps.append(fqe.vdot(guess_vecs[idx], f_k))
-                for idx in range(len(guess_vecs)):
-                    f_k.sector(gv_sector).coeff -= (overlaps[idx] *
-                                                    guess_vecs[idx].sector(
-                                                        gv_sector).coeff)
+            # # orthogonalize preconditioned_residual
+            overlaps = []
+            # print(len(guess_vecs))
+            for idx in range(len(guess_vecs)):
+                overlaps.append(fqe.vdot(guess_vecs[idx], f_k))
+            for idx in range(len(guess_vecs)):
+                f_k.sector(gv_sector).coeff -= (overlaps[idx] *
+                                                guess_vecs[idx].sector(
+                                                    gv_sector).coeff)
 
-                f_k.normalize()
-                guess_vecs.append(f_k)
+            f_k.normalize()
+            guess_vecs.append(f_k)
         print("Norm of residuals")
         print(residual_norms)
         print("Current lowest roots")

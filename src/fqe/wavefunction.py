@@ -493,7 +493,7 @@ class Wavefunction:
                                 algo: str,
                                 hamil: 'hamiltonian.Hamiltonian',
                                 accuracy: float = 1.0E-14,
-                                expansion: int = 30,
+                                expansion: int = 1000,
                                 spec_lim: Optional[List[float]] = None
                                ) -> 'Wavefunction':
         """Perform the exponentiation of fermionic algebras to the

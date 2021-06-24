@@ -42,6 +42,7 @@ from fqe.algorithm.generalized_doubles_factorization import \
 
 from fqe.algorithm.low_rank import evolve_fqe_charge_charge_unrestricted, \
     evolve_fqe_givens_unrestricted
+from fqe.fqe_ops.fqe_ops import S2Operator
 
 
 def valdemaro_reconstruction(tpdm, n_electrons):
@@ -240,6 +241,13 @@ class ADAPT:
                                         elec_hamil.dim(),
                                         conserve_number=True)
         self.elec_hamil = elec_hamil
+
+        # generate s2-fqe operator for gradient
+        s2_of = of.s_squared_operator(oei.shape[0])
+        s2_fqe = fqe.build_hamiltonian(s2_of, norb=oei.shape[0],
+                                       conserve_number=True)
+        self.s2_fqe = s2_fqe
+
         self.iter_max = iter_max
         self.sdim = elec_hamil.dim()
         # change to use multiplicity to derive this for open shell
@@ -252,13 +260,21 @@ class ADAPT:
         self.stopping_eps = stopping_epsilon
         self.delta_e_eps = delta_e_eps
 
+    def evolve_wavefunction(self, init_wf, operator_pool_fqe, existing_parameters):
+        wf = copy.deepcopy(init_wf)
+        for fqe_op, coeff in zip(operator_pool_fqe, existing_parameters):
+            wf = wf.time_evolve(coeff, fqe_op)
+        return wf
+
     def adapt_vqe(self,
                   initial_wf: Wavefunction,
                   opt_method: str = 'L-BFGS-B',
                   opt_options=None,
                   num_opt_var=None,
                   v_reconstruct: bool = True,
-                  num_ops_add: int = 1):
+                  num_ops_add: int = 1,
+                  shift=None,
+                  ss=None):
         """
         Run ADAPT-VQE using
 
@@ -269,26 +285,41 @@ class ADAPT:
             v_reconstruct: use valdemoro reconstruction
             num_ops_add: add this many operators from the pool to the
                          wavefunction
+            shift: penalty parameter shift * (<ss> - ss)^2 on the objective
+            ss: desired s^2 expectation value. Both shift and ss are optional
+                if either is set to None the input is ignored.
         """
         if opt_options is None:
             opt_options = {}
+
+        if shift is None and ss is None:
+            self.s2_penalty = None
+            self.shift = None
+            self.ss = None
+        else:
+            self.s2_penalty = True
+            self.shift = shift
+            self.ss = ss
+
         self.num_opt_var = num_opt_var
-        operator_pool = []
-        operator_pool_fqe: List[ABCHamiltonian] = []
-        existing_parameters: List[float] = []
+        self.local_operator_pool = []
+        self.operator_pool_fqe: List[ABCHamiltonian] = []
+        self.existing_parameters: List[float] = []
         self.gradients = []
         self.energies = [initial_wf.expectationValue(self.k2_fop)]
         iteration = 0
         while iteration < self.iter_max:
             # get current wavefunction
             wf = copy.deepcopy(initial_wf)
-            for fqe_op, coeff in zip(operator_pool_fqe, existing_parameters):
+            for fqe_op, coeff in zip(self.operator_pool_fqe, self.existing_parameters):
                 wf = wf.time_evolve(coeff, fqe_op)
 
             # calculate rdms for grad
             _, tpdm = wf.sector((self.nele, self.sz)).get_openfermion_rdms()
+            s2_val = S2Operator().contract(brastate=wf, ketstate=wf)
             if v_reconstruct:
                 d3 = 6 * valdemaro_reconstruction(tpdm / 2, self.nele)
+                print("BAD HERE")
             else:
                 d3 = wf.sector((self.nele, self.sz)).get_three_pdm()
 
@@ -316,28 +347,28 @@ class ADAPT:
             pool_terms = [
                 self.operator_pool.op_pool[i] for i in max_grad_terms_idx
             ]
-            operator_pool.extend(pool_terms)
+            self.local_operator_pool.extend(pool_terms)
             fqe_ops: List[ABCHamiltonian] = []
             for f_op in pool_terms:
                 fqe_ops.append(
                     build_hamiltonian(1j * f_op,
                                       self.sdim,
                                       conserve_number=True))
-            operator_pool_fqe.extend(fqe_ops)
-            existing_parameters.extend([0] * len(fqe_ops))
+            self.operator_pool_fqe.extend(fqe_ops)
+            self.existing_parameters.extend([0] * len(fqe_ops))
 
             if self.num_opt_var is not None:
-                if len(operator_pool_fqe) < self.num_opt_var:
-                    pool_to_op = operator_pool_fqe
-                    params_to_op = existing_parameters
+                if len(self.operator_pool_fqe) < self.num_opt_var:
+                    pool_to_op = self.operator_pool_fqe
+                    params_to_op = self.existing_parameters
                     current_wf = copy.deepcopy(initial_wf)
                 else:
-                    pool_to_op = operator_pool_fqe[-self.num_opt_var:]
-                    params_to_op = existing_parameters[-self.num_opt_var:]
+                    pool_to_op = self.operator_pool_fqe[-self.num_opt_var:]
+                    params_to_op = self.existing_parameters[-self.num_opt_var:]
                     current_wf = copy.deepcopy(initial_wf)
                     for fqe_op, coeff in zip(
-                            operator_pool_fqe[:-self.num_opt_var],
-                            existing_parameters[:-self.num_opt_var]):
+                            self.operator_pool_fqe[:-self.num_opt_var],
+                            self.existing_parameters[:-self.num_opt_var]):
                         current_wf = current_wf.time_evolve(coeff, fqe_op)
 
                 new_parameters, current_e = self.optimize_param(
@@ -347,29 +378,105 @@ class ADAPT:
                     opt_method,
                     opt_options=opt_options)
 
-                if len(operator_pool_fqe) < self.num_opt_var:
-                    existing_parameters = new_parameters.tolist()
+                if len(self.operator_pool_fqe) < self.num_opt_var:
+                    self.existing_parameters = new_parameters.tolist()
                 else:
-                    existing_parameters[-self.num_opt_var:] = \
+                    self.existing_parameters[-self.num_opt_var:] = \
                         new_parameters.tolist()
             else:
                 new_parameters, current_e = self.optimize_param(
-                    operator_pool_fqe,
-                    existing_parameters,
+                    self.operator_pool_fqe,
+                    self.existing_parameters,
                     initial_wf,
                     opt_method,
                     opt_options=opt_options)
-                existing_parameters = new_parameters.tolist()
+                self.existing_parameters = new_parameters.tolist()
 
             if self.verbose:
-                print("{: 5d}\t{: 5.15f}\t{: 5.15f}".format(
-                    iteration, current_e, max(np.abs(pool_grad))))
+                print("{: 5d}\t{: 5.15f}\t{: 5.15f}\t{: 5.15f}".format(
+                    iteration, current_e, max(np.abs(pool_grad)), s2_val))
             self.energies.append(current_e)
             self.gradients.append(pool_grad)
             if max(np.abs(pool_grad)) < self.stopping_eps or np.abs(
                     self.energies[-2] - self.energies[-1]) < self.delta_e_eps:
                 break
             iteration += 1
+
+    # def optimize_param(
+    #         self,
+    #         pool: Union[List[of.FermionOperator], List[ABCHamiltonian]],
+    #         existing_params: Union[List, np.ndarray],
+    #         initial_wf: Wavefunction,
+    #         opt_method: str,
+    #         opt_options=None) -> Tuple[np.ndarray, float]:
+    #     """Optimize a wavefunction given a list of generators
+    #     Args:
+    #         pool: generators of rotation
+    #         existing_params: parameters for the generators
+    #         initial_wf: initial wavefunction
+    #         opt_method: Scpy.optimize method
+    #     """
+    #     if opt_options is None:
+    #         opt_options = {}
+
+    #     def cost_func(params):
+    #         assert len(params) == len(pool)
+    #         # compute wf for function call
+    #         wf = copy.deepcopy(initial_wf)
+    #         for op, coeff in zip(pool, params):
+    #             if np.isclose(coeff, 0):
+    #                 continue
+    #             if isinstance(op, ABCHamiltonian):
+    #                 fqe_op = op
+    #             else:
+    #                 print("Found a OF Hamiltonian")
+    #                 fqe_op = build_hamiltonian(1j * op,
+    #                                            self.sdim,
+    #                                            conserve_number=True)
+    #             if isinstance(fqe_op, ABCHamiltonian):
+    #                 wf = wf.time_evolve(coeff, fqe_op)
+    #             else:
+    #                 raise ValueError("Can't evolve operator type {}".format(
+    #                     type(fqe_op)))
+
+    #         # compute gradients
+    #         grad_vec = np.zeros(len(params), dtype=np.complex128)
+    #         # avoid extra gradient computation if we can
+    #         if opt_method not in ['Nelder-Mead', 'COBYLA']:
+    #             for pidx, _ in enumerate(params):
+    #                 # evolve e^{iG_{n-1}g_{n-1}}e^{iG_{n-2}g_{n-2}}x
+    #                 # G_{n-3}e^{-G_{n-3}g_{n-3}...|0>
+    #                 grad_wf = copy.deepcopy(initial_wf)
+    #                 for gidx, (op, coeff) in enumerate(zip(pool, params)):
+    #                     if isinstance(op, ABCHamiltonian):
+    #                         fqe_op = op
+    #                     else:
+    #                         fqe_op = build_hamiltonian(1j * op,
+    #                                                    self.sdim,
+    #                                                    conserve_number=True)
+    #                     if not np.isclose(coeff, 0):
+    #                         grad_wf = grad_wf.time_evolve(coeff, fqe_op)
+    #                         # if looking at the pth parameter then apply the
+    #                         # operator to the state
+    #                     if gidx == pidx:
+    #                         grad_wf = grad_wf.apply(fqe_op)
+
+    #                 # grad_val = grad_wf.expectationValue(self.elec_hamil,
+    #                 # brawfn=wf)
+    #                 grad_val = grad_wf.expectationValue(self.k2_fop, brawfn=wf)
+
+    #                 grad_vec[pidx] = -1j * grad_val + 1j * grad_val.conj()
+    #                 assert np.isclose(grad_vec[pidx].imag, 0)
+
+    #         return (wf.expectationValue(self.k2_fop).real,
+    #                 np.array(grad_vec.real, order='F'))
+
+    #     res = sp.optimize.minimize(cost_func,
+    #                                existing_params,
+    #                                method=opt_method,
+    #                                jac=True,
+    #                                options=opt_options)
+    #     return res.x, res.fun
 
     def optimize_param(
             self,
@@ -389,61 +496,167 @@ class ADAPT:
         if opt_options is None:
             opt_options = {}
 
-        def cost_func(params):
-            assert len(params) == len(pool)
-            # compute wf for function call
-            wf = copy.deepcopy(initial_wf)
-            for op, coeff in zip(pool, params):
-                if np.isclose(coeff, 0):
-                    continue
-                if isinstance(op, ABCHamiltonian):
-                    fqe_op = op
-                else:
-                    print("Found a OF Hamiltonian")
-                    fqe_op = build_hamiltonian(1j * op,
-                                               self.sdim,
-                                               conserve_number=True)
-                if isinstance(fqe_op, ABCHamiltonian):
-                    wf = wf.time_evolve(coeff, fqe_op)
-                else:
-                    raise ValueError("Can't evolve operator type {}".format(
-                        type(fqe_op)))
-
-            # compute gradients
-            grad_vec = np.zeros(len(params), dtype=np.complex128)
-            # avoid extra gradient computation if we can
-            if opt_method not in ['Nelder-Mead', 'COBYLA']:
-                for pidx, _ in enumerate(params):
-                    # evolve e^{iG_{n-1}g_{n-1}}e^{iG_{n-2}g_{n-2}}x
-                    # G_{n-3}e^{-G_{n-3}g_{n-3}...|0>
-                    grad_wf = copy.deepcopy(initial_wf)
-                    for gidx, (op, coeff) in enumerate(zip(pool, params)):
-                        if isinstance(op, ABCHamiltonian):
-                            fqe_op = op
-                        else:
-                            fqe_op = build_hamiltonian(1j * op,
-                                                       self.sdim,
-                                                       conserve_number=True)
-                        if not np.isclose(coeff, 0):
-                            grad_wf = grad_wf.time_evolve(coeff, fqe_op)
-                            # if looking at the pth parameter then apply the
-                            # operator to the state
-                        if gidx == pidx:
-                            grad_wf = grad_wf.apply(fqe_op)
-
-                    # grad_val = grad_wf.expectationValue(self.elec_hamil,
-                    # brawfn=wf)
-                    grad_val = grad_wf.expectationValue(self.k2_fop, brawfn=wf)
-
-                    grad_vec[pidx] = -1j * grad_val + 1j * grad_val.conj()
-                    assert np.isclose(grad_vec[pidx].imag, 0)
-
-            return (wf.expectationValue(self.k2_fop).real,
-                    np.array(grad_vec.real, order='F'))
-
-        res = sp.optimize.minimize(cost_func,
+        res = sp.optimize.minimize(adapt_cost_func_and_grad_parallel,
                                    existing_params,
+                                   args=(
+                                   pool, copy.deepcopy(initial_wf), self.sdim,
+                                   self.k2_fop, opt_method, self.s2_penalty,
+                                   self.shift, self.ss, self.s2_fqe),
                                    method=opt_method,
                                    jac=True,
                                    options=opt_options)
         return res.x, res.fun
+
+
+def adapt_cost_func_and_grad(params, pool, initial_wf, sdim, k2_fop, opt_method,
+                             s2_penalty, shift, ss, s2_fqe):
+    assert len(params) == len(pool)
+    # compute wf for function call
+    wf = copy.deepcopy(initial_wf)
+    for op, coeff in zip(pool, params):
+        if np.isclose(coeff, 0):
+            continue
+        if isinstance(op, ABCHamiltonian):
+            fqe_op = op
+        else:
+            print("Found a OF Hamiltonian")
+            fqe_op = build_hamiltonian(1j * op,
+                                       sdim,
+                                       conserve_number=True)
+        if isinstance(fqe_op, ABCHamiltonian):
+            wf = wf.time_evolve(coeff, fqe_op)
+        else:
+            raise ValueError("Can't evolve operator type {}".format(
+                type(fqe_op)))
+
+    # compute gradients
+    s2_val = S2Operator().contract(wf, wf)
+    grad_vec = np.zeros(len(params), dtype=np.complex128)
+    s2_grad_part = 0.
+    # avoid extra gradient computation if we can
+    if opt_method not in ['Nelder-Mead', 'COBYLA']:
+        for pidx, _ in enumerate(params):
+            # evolve e^{iG_{n-1}g_{n-1}}e^{iG_{n-2}g_{n-2}}x
+            # G_{n-3}e^{-G_{n-3}g_{n-3}...|0>
+            grad_wf = copy.deepcopy(initial_wf)
+            for gidx, (op, coeff) in enumerate(zip(pool, params)):
+                if isinstance(op, ABCHamiltonian):
+                    fqe_op = op
+                else:
+                    fqe_op = build_hamiltonian(1j * op,
+                                               sdim,
+                                               conserve_number=True)
+                if not np.isclose(coeff, 0):
+                    grad_wf = grad_wf.time_evolve(coeff, fqe_op)
+                    # if looking at the pth parameter then apply the
+                    # operator to the state
+                if gidx == pidx:
+                    grad_wf = grad_wf.apply(fqe_op)
+
+            # grad_val = grad_wf.expectationValue(self.elec_hamil,
+            # brawfn=wf)
+            grad_val = grad_wf.expectationValue(k2_fop, brawfn=wf)
+
+            grad_vec[pidx] = -1j * grad_val + 1j * grad_val.conj()
+            assert np.isclose(grad_vec[pidx].imag, 0)
+
+            if s2_penalty is not None:
+
+                grad_s2 = grad_wf.expectationValue(s2_fqe,
+                                                   brawfn=wf)
+
+                grad_val_s2 = 2. * shift * (s2_val.real - ss) * (
+                            -1j * grad_s2 + 1j * grad_s2.conj())
+                s2_grad_part += grad_val_s2.real
+                grad_vec[pidx] += grad_val_s2
+
+
+    if s2_penalty is not None:
+        # print(s2_grad_part, shift, ss, s2_val)
+        return (wf.expectationValue(k2_fop).real + shift * (s2_val.real - ss)**2,
+                np.array(grad_vec.real, order='F'))
+    else:
+        return (wf.expectationValue(k2_fop).real,
+                np.array(grad_vec.real, order='F'))
+
+def adapt_cost_func_and_grad_parallel(params, pool, initial_wf, sdim, k2_fop,
+                                      opt_method, s2_penalty, shift, ss, s2_fqe):
+    from joblib import delayed, Parallel
+    assert len(params) == len(pool)
+    # compute wf for function call
+    wf = copy.deepcopy(initial_wf)
+    for op, coeff in zip(pool, params):
+        if np.isclose(coeff, 0):
+            continue
+        if isinstance(op, ABCHamiltonian):
+            fqe_op = op
+        else:
+            print("Found a OF Hamiltonian")
+            fqe_op = build_hamiltonian(1j * op,
+                                       sdim,
+                                       conserve_number=True)
+        if isinstance(fqe_op, ABCHamiltonian):
+            wf = wf.time_evolve(coeff, fqe_op)
+        else:
+            raise ValueError("Can't evolve operator type {}".format(
+                type(fqe_op)))
+
+    # compute gradients
+    s2_val = S2Operator().contract(wf, wf)
+    grad_vec = np.zeros(len(params), dtype=np.complex128)
+    s2_grad_part = 0.
+
+    # avoid extra gradient computation if we can
+    if opt_method not in ['Nelder-Mead', 'COBYLA']:
+        grad_wf = copy.deepcopy(initial_wf)
+        with Parallel(n_jobs=-1, backend='loky') as parallel:
+            res = parallel(
+                delayed(atomic_grad_calculation)(xx, params, pool,
+                                                 copy.deepcopy(grad_wf), k2_fop,
+                                                 wf, s2_fqe, s2_val,  s2_penalty, ss,
+                                                 shift) for xx in
+                range(len(params)))
+            for ii, val in res:
+                grad_vec[ii] = val
+
+    if s2_penalty is not None:
+        print(s2_grad_part, shift, sgit s, s2_val)
+        return (wf.expectationValue(k2_fop).real + shift * (s2_val.real - ss)**2,
+                np.array(grad_vec.real, order='F'))
+    else:
+        return (wf.expectationValue(k2_fop).real,
+                np.array(grad_vec.real, order='F'))
+
+def atomic_grad_calculation(pidx, params, pool, grad_wf, k2_fop, brawfn,
+                            s2_fqe,  s2_val, s2_penalty, ss, shift):
+    for gidx, (op, coeff) in enumerate(zip(pool, params)):
+        if isinstance(op, ABCHamiltonian):
+            fqe_op = op
+        else:
+            fqe_op = build_hamiltonian(1j * op,
+                                       sdim,
+                                       conserve_number=True)
+        if not np.isclose(coeff, 0):
+            grad_wf = grad_wf.time_evolve(coeff, fqe_op)
+            # if looking at the pth parameter then apply the
+            # operator to the state
+        if gidx == pidx:
+            grad_wf = grad_wf.apply(fqe_op)
+
+    # grad_val = grad_wf.expectationValue(self.elec_hamil,
+    # brawfn=wf)
+    grad_val = grad_wf.expectationValue(k2_fop, brawfn=brawfn)
+
+    returned_gval = -1j * grad_val + 1j * grad_val.conj()
+
+    if s2_penalty is not None:
+
+        grad_s2 = grad_wf.expectationValue(s2_fqe,
+                                           brawfn=brawfn)
+
+        grad_val_s2 = 2. * shift * (s2_val.real - ss) * (
+                    -1j * grad_s2 + 1j * grad_s2.conj())
+        returned_gval += grad_val_s2
+
+    assert np.isclose(returned_gval.imag, 0)
+    return (pidx, returned_gval.real)
