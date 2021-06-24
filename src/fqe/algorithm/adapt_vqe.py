@@ -620,7 +620,7 @@ def adapt_cost_func_and_grad_parallel(params, pool, initial_wf, sdim, k2_fop,
                 grad_vec[ii] = val
 
     if s2_penalty is not None:
-        print(s2_grad_part, shift, sgit s, s2_val)
+        # print(s2_grad_part, shift, ss, s2_val)
         return (wf.expectationValue(k2_fop).real + shift * (s2_val.real - ss)**2,
                 np.array(grad_vec.real, order='F'))
     else:
