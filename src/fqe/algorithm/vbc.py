@@ -18,7 +18,7 @@ import copy
 from itertools import product
 import numpy as np
 import scipy as sp
-from scipy.linalg import expm
+from scipy.linalg import expm, logm
 
 import openfermion as of
 from openfermion import (
@@ -31,6 +31,7 @@ import fqe
 from fqe.wavefunction import Wavefunction
 from fqe.hamiltonians.restricted_hamiltonian import RestrictedHamiltonian
 from fqe.hamiltonians.hamiltonian import Hamiltonian as ABCHamiltonian
+from fqe.hamiltonians.general_hamiltonian import General as GeneralHamiltonian
 from fqe.fqe_decorators import build_hamiltonian
 from fqe.algorithm.brillouin_calculator import (
     get_fermion_op,
@@ -44,6 +45,9 @@ from fqe.algorithm.low_rank import evolve_fqe_charge_charge_unrestricted, \
     evolve_fqe_givens_unrestricted
 
 from uthc.takagi_spin_adapted import TwoBodySOSEvolution
+from uthc.oo_costgrad_api import maximize_charge_charge
+from uthc.takagi_spin_adapted import sos_takagi_ab_sector, \
+    sos_takagi_single_sector
 
 
 def valdemaro_reconstruction_functional(tpdm, n_electrons, true_opdm=None):
@@ -197,38 +201,84 @@ class VBC:
                                       one_body_rotation=expm(one_body_residual))
         return sos_op
 
-    def get_takagi_tensor_decomp(self, residual, update_utc):
-        # return TwoBodySOSEvolution(generalized_doubles=residual,
-        #                            alpha_doubles=residual[::2, ::2, ::2, ::2],
-        #                            beta_doubles=residual[1::2, 1::2, 1::2, 1::2],
-        #                            alpha_beta_doubles=residual[::2, 1::2, 1::2, ::2])
-        from uthc.takagi_spin_adapted import sos_takagi_ab_sector, \
-            sos_takagi_single_sector
-
-        plus_basis, plus_nn, minus_basis, minus_nn = \
-            sos_takagi_ab_sector(residual[::2, 1::2, 1::2, ::2])
+    def get_uthc_decomp(self, residual, update_utc):
+        """Perform unitary fitting"""
+        plus_basis, plus_nn, minus_basis, minus_nn, obr = \
+            sos_takagi_single_sector(residual)
+        print(obr)
+        lu = logm(plus_basis[0])
+        lu_X = lu.real
+        lu_Y = lu.imag
+        init_params = np.hstack((lu_X.flatten(), lu_Y.flatten()))
+        
+        if update_utc is None:
+            max_res = 1
+        else:
+            max_res = update_utc
+            
+        
         nso = residual.shape[0]
-        ops_to_return = []
-        for ll in range(len(plus_basis)):
-            v1_a, v1_b = plus_basis[ll]
-            oww1ab = -1j * plus_nn[ll]
-            v2_a, v2_b = minus_basis[ll]
-            oww2ab = -1j * minus_nn[ll]
-            # ab-part
-            # temp_gen = np.einsum('pi,si,ij,qj,rj->pqrs', v1_a, v1_a.conj(),
-            #                      oww1ab, v1_b, v1_b.conj())
-            # temp_gen += np.einsum('pi,si,ij,qj,rj->pqrs', v2_a, v2_a.conj(),
-            #                       oww2ab, v2_b, v2_b.conj())
-            temp_gen = np.einsum('iP,iQ,ij,jR,jS->PRSQ', v1_a.T, v1_a.conj().T,
-                                 oww1ab, v1_b.T, v1_b.conj().T)
-            # test_tensor[::2, 1::2, 1::2, ::2] += temp_gen
+        # start here for nn-unitary compression
+        res_obj = maximize_charge_charge(residual.transpose((0, 3, 1, 2)),
+                                         initial_parameters=init_params,
+                                         method='BFGS', verbose=False,
+                                         max_iter=max_res, gtol=1.0E-5,
+                                         rank_stop=np.inf,
+                                         param_restrictions=None)
+        
+        fqe_ops = []
+        if update_utc is None:
+            max_res = len(res_obj)
+        for idx, (u, jj) in enumerate(res_obj):
+            temp_tilde = np.einsum('iP,iQ,ij,jR,jS->PQRS', u.T, u.conj().T, jj,
+                                   u.T, u.conj().T)
             t2_op = of.FermionOperator()
             for p, q, r, s in product(range(nso), repeat=4):
-                t2_op += of.FermionOperator(((p, 1), (q, 1), (r, 0), (s, 0)),
-                                            coefficient=temp_gen[p//2, q//2, r//2, s//2])
-            ops_to_return.append(t2_op - of.hermitian_conjugated(t2_op))
-        return ops_to_return
-            # fqe_op = fqe.build_hamiltonian(2j * t2_op, norb=molecule.n_orbitals)
+                t2_op += of.FermionOperator(((p, 1), (q, 0), (r, 1), (s, 0)), coefficient=temp_tilde[p, q, r, s])
+            fqe_op = fqe.build_hamiltonian(1j * t2_op, norb=nso//2)
+            fqe_ops.append(fqe_op)
+        return fqe_ops
+        
+    def get_takagi_tensor_decomp(self, residual, update_utc):
+        print("GEnerating takagi decomp")
+        from uthc.takagi_spin_adapted import sos_takagi_single_sector
+        plus_basis, plus_nn, minus_basis, minus_nn, obr = sos_takagi_single_sector(
+            residual)
+        fqe_ops = []
+        nso = residual.shape[0]
+       
+        if update_utc > len(plus_basis):
+            max_iter = len(plus_basis) 
+        else:
+            max_iter = update_utc
+        for ll in range(max_iter):
+            print("ll - {}".format(ll))
+            assert np.allclose(plus_basis[ll].conj().T @ plus_basis[ll],
+                               np.eye(nso))
+            assert np.allclose(minus_basis[ll].conj().T @ minus_basis[ll],
+                               np.eye(nso))
+
+            temp_tilde = np.einsum('iP,iQ,ij,jR,jS->PQRS', plus_basis[ll].T,
+                                   plus_basis[ll].conj().T, -1j * plus_nn[ll],
+                                   plus_basis[ll].T, plus_basis[ll].conj().T)
+            t2_op = of.FermionOperator()
+            for p, q, r, s in product(range(nso), repeat=4):
+                t2_op += of.FermionOperator(((p, 1), (q, 0), (r, 1), (s, 0)),
+                                            coefficient=temp_tilde[p, q, r, s])
+            fqe_op = fqe.build_hamiltonian(1j * t2_op, norb=nso//2)
+            fqe_ops.append(fqe_op)
+
+            temp_tilde = np.einsum('iP,iQ,ij,jR,jS->PQRS', minus_basis[ll].T,
+                                   minus_basis[ll].conj().T, -1j * minus_nn[ll],
+                                   minus_basis[ll].T, minus_basis[ll].conj().T)
+            t2_op = of.FermionOperator()
+            for p, q, r, s in product(range(nso), repeat=4):
+                t2_op += of.FermionOperator(((p, 1), (q, 0), (r, 1), (s, 0)),
+                                            coefficient=temp_tilde[p, q, r, s])
+            fqe_op = fqe.build_hamiltonian(1j * t2_op, norb=nso//2)
+            fqe_ops.append(fqe_op)
+        return fqe_ops[:update_utc]
+
 
 
     def get_takagi_tensor_decomp_ab(self, residual, update_utc, eig_cutoff=None):
@@ -375,9 +425,11 @@ class VBC:
             # get ACSE Residual and 2-RDM gradient
             acse_residual = two_rdo_commutator_symm(
                 self.reduced_ham.two_body_tensor, tpdm, d3)
+            
 
             if generator_decomp is None:
                 fop = get_fermion_op(acse_residual)
+                fop = [fop]
             elif generator_decomp is 'svd':
                 new_residual = np.zeros_like(acse_residual)
                 for p, q, r, s in product(range(nso), repeat=4):
@@ -386,26 +438,29 @@ class VBC:
 
                 fop = self.get_svd_tensor_decomp(new_residual, generator_rank)
             elif generator_decomp is 'takagi':
+                # List: fqe.ABCHamiltonian
                 fop = self.get_takagi_tensor_decomp(acse_residual,
                                                     generator_rank)
-                fop = fop[0]
+            elif generator_decomp is 'uc':
+                fop = self.get_uthc_decomp(acse_residual, generator_rank)
             else:
                 raise ValueError(
                     "Generator decomp must be None, svd, or takagi")
 
-            operator_pool.extend([fop])
+            operator_pool.extend(fop)
             fqe_ops: List[Union[ABCHamiltonian, SumOfSquaresOperator]] = []
-            if isinstance(fop, ABCHamiltonian):
-                fqe_ops.append(fop)
-            elif isinstance(fop, (SumOfSquaresOperator, TwoBodySOSEvolution)):
-                fqe_ops.append(fop)
+            if isinstance(fop[0], (ABCHamiltonian, GeneralHamiltonian)):
+                fqe_ops.extend(fop)
+            elif isinstance(fop[0], (SumOfSquaresOperator, TwoBodySOSEvolution)):
+                fqe_ops.extend(fop)
             else:
-                fqe_ops.append(
-                    build_hamiltonian(1j * fop, self.sdim,
-                                      conserve_number=True))
+                for ff in fop:
+                    fqe_ops.append(
+                        build_hamiltonian(1j * ff, self.sdim,
+                                          conserve_number=True))
 
             operator_pool_fqe.extend(fqe_ops)
-            existing_parameters.extend([0])
+            existing_parameters.extend([0] * len(fqe_ops))
 
             if self.num_opt_var is not None:
                 if len(operator_pool_fqe) < self.num_opt_var:
@@ -458,51 +513,6 @@ class VBC:
                 break
             iteration += 1
 
-    def optimize_param_fd(
-            self,
-            pool: Union[List[of.FermionOperator], List[ABCHamiltonian]],
-            existing_params: Union[List, np.ndarray],
-            initial_wf: Wavefunction,
-            opt_method: str,
-            opt_options=None) -> Tuple[np.ndarray, float]:
-        """Optimize a wavefunction given a list of generators
-
-        Args:
-            pool: generators of rotation
-            existing_params: parameters for the generators
-            initial_wf: initial wavefunction
-            opt_method: Scpy.optimize method
-        """
-        if opt_options is None:
-            opt_options = {}
-
-        def cost_func(params):
-            assert len(params) == len(pool)
-            # compute wf for function call
-            wf = copy.deepcopy(initial_wf)
-            for op, coeff in zip(pool, params):
-                if np.isclose(coeff, 0):
-                    continue
-                if isinstance(op, ABCHamiltonian):
-                    wf = wf.time_evolve(coeff, op)
-                elif isinstance(op, SumOfSquaresOperator):
-                    wf = op.time_evolve(wf, coeff)
-                elif isinstance(op, TwoBodySOSEvolution):
-                    wf = op.evolve_ab(wf, coeff)
-                else:
-                    raise ValueError("Can't evolve operator type {}".format(
-                        type(fqe_op)))
-
-            eval = wf.expectationValue(self.k2_fop).real
-            print(eval)
-            return eval
-
-        res = sp.optimize.minimize(cost_func,
-                                   existing_params,
-                                   method=opt_method,
-                                   jac=False,
-                                   options=opt_options)
-        return res.x, res.fun
 
     def optimize_param(
             self,
@@ -608,7 +618,7 @@ class VBC:
             return (wf.expectationValue(self.k2_fop).real,
                     np.array(grad_vec.real, order='F'))
 
-        res = sp.optimize.minimize(cost_func,
+        res = sp.optimize.minimize(cost_func_parallel,
                                    existing_params,
                                    method=opt_method,
                                    jac=True,

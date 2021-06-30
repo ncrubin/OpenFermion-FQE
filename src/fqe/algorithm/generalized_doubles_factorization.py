@@ -116,7 +116,7 @@ def doubles_factorization_svd(generator_tensor: np.ndarray, eig_cutoff=None):
     return ul, vl, one_body_residual, ul_ops, vl_ops, one_body_op
 
 
-def takagi(N, tol=1e-13, rounding=13):
+def takagi(N, tol=1e-10, rounding=10):
     r"""Autonne-Takagi decomposition of a complex symmetric (not Hermitian!) matrix.
 
     Note that singular values of N are considered equal if they are equal after np.round(values, tol).
@@ -137,7 +137,7 @@ def takagi(N, tol=1e-13, rounding=13):
     if n != m:
         raise ValueError("The input matrix must be square")
     if np.linalg.norm(N - np.transpose(N)) >= tol:
-        raise ValueError("The input matrix is not symmetric")
+        raise ValueError("The input matrix is not symmetric |N - N.T|| = {}".format(np.linalg.norm(N - np.transpose(N))))
 
     N = np.real_if_close(N)
 
