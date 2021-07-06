@@ -581,6 +581,12 @@ class VBC:
 
                     grad_vec[pidx] = -1j * grad_val + 1j * grad_val.conj()
                     assert np.isclose(grad_vec[pidx].imag, 0)
+
+
+            # tval, gval = cost_func_backprop(params)
+            # assert np.isclose(wf.expectationValue(self.k2_fop).real, tval)
+            # assert np.allclose(gval, np.array(grad_vec.real, order='F'))
+
             return (wf.expectationValue(self.k2_fop).real,
                     np.array(grad_vec.real, order='F'))
 
@@ -615,10 +621,73 @@ class VBC:
                         in range(len(params)))
                     for ii, val in res:
                         grad_vec[ii] = val
+
+
+            tval, gval = cost_func_backprop(params)
+            assert np.isclose(wf.expectationValue(self.k2_fop).real, tval)
+            assert np.allclose(gval, np.array(grad_vec.real, order='F'))
+
             return (wf.expectationValue(self.k2_fop).real,
                     np.array(grad_vec.real, order='F'))
 
-        res = sp.optimize.minimize(cost_func_parallel,
+        def cost_func_backprop(params):
+            """Implement function eval and gradient with backprop like a
+            algorithm--i.e.  dynamic programming"""
+            assert len(params) == len(pool)
+
+            # compute wf for function call
+            wf = copy.deepcopy(initial_wf)
+            for op, coeff in zip(pool, params):
+                if np.isclose(coeff, 0):
+                    continue
+                if isinstance(op, ABCHamiltonian):
+                    wf = wf.time_evolve(coeff, op)
+                elif isinstance(op, SumOfSquaresOperator):
+                    wf = op.time_evolve(wf, coeff)
+                elif isinstance(op, TwoBodySOSEvolution):
+                    wf = op.evolve_ab(wf, coeff)
+                else:
+                    raise ValueError("Can't evolve operator type {}".format(
+                        type(fqe_op)))
+
+            lam_wf = wf.apply(self.k2_fop)
+            phi_wf = wf
+
+            # compute gradients
+            grad_vec = np.zeros(len(params), dtype=np.complex128)
+            # avoid extra gradient computation if we can
+            if opt_method not in ['Nelder-Mead', 'COBYLA']:
+                # evolve e^{iG_{n-1}g_{n-1}}e^{iG_{n-2}g_{n-2}}x
+                # G_{n-3}e^{-G_{n-3}g_{n-3}...|0>
+                # grad_wf = copy.deepcopy(initial_wf)
+                for gidx, (op, coeff) in reversed(list(enumerate(zip(pool, params)))):
+                    # generator operator
+                    if isinstance(op, ABCHamiltonian):
+                        fqe_op = op
+                    # elif isinstance(op, SumOfSquaresOperator):
+                    #     pass
+                    # elif isinstance(op, TwoBodySOSEvolution):
+                    #     pass
+                    else:
+                        fqe_op = build_hamiltonian(1j * op,
+                                                   self.sdim,
+                                                   conserve_number=True)
+
+                    # |phi> = U_{k}^{\dagger}|phi>
+                    phi_wf = phi_wf.time_evolve(-coeff, fqe_op)
+                    lam_wf = lam_wf.time_evolve(-coeff, fqe_op)
+
+                    mu_wf = copy.deepcopy(phi_wf)
+                    mu_wf = mu_wf.apply(fqe_op)
+
+                    grad_val = fqe.vdot(lam_wf, mu_wf)
+                    grad_vec[gidx]  = -1j * grad_val + 1j * grad_val.conj()
+                    assert np.isclose(grad_vec[gidx].imag, 0)
+
+            return (wf.expectationValue(self.k2_fop).real,
+                    np.array(grad_vec.real, order='F'))
+
+        res = sp.optimize.minimize(cost_func_backprop,
                                    existing_params,
                                    method=opt_method,
                                    jac=True,
