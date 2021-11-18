@@ -1,5 +1,6 @@
 include requirements.txt
 recursive-include src/fqe/lib *.c *.h *.pyx *.pxi
+recursive-include tests *.py *.hdf5 *.npy *.pickle
 
 # Cython generated
 exclude src/fqe/lib/_fqe_data.c
