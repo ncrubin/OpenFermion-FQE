@@ -407,7 +407,8 @@ def wrap_apply_generated_unitary(apply_generated_unitary):
                 ops: Union['FermionOperator', 'hamiltonian.Hamiltonian'],
                 accuracy: float = 1.0E-15,
                 expansion: int = 30,
-                spec_lim: Optional[List[float]] = None):
+                spec_lim: Optional[List[float]] = None,
+                verbose=True):
         """Perform the exponentiation of fermionic algebras to the
         wavefunction according to the method and accuracy.
 
@@ -424,6 +425,9 @@ def wrap_apply_generated_unitary(apply_generated_unitary):
 
             spec_lim (List[float]): spectral range of the Hamiltonian, the length of \
                 the list should be 2. Optional.
+            
+            verbose (bool): print the convergence of the Taylor expansion
+
 
         Returns:
             newwfn (Wavefunction): a new initialized wavefunction object
@@ -437,6 +441,7 @@ def wrap_apply_generated_unitary(apply_generated_unitary):
                                        hamil,
                                        accuracy=accuracy,
                                        expansion=expansion,
-                                       spec_lim=spec_lim)
+                                       spec_lim=spec_lim,
+                                       verbose=verbose)
 
     return convert

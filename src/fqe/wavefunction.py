@@ -513,7 +513,8 @@ class Wavefunction:
                                 hamil: 'hamiltonian.Hamiltonian',
                                 accuracy: float = 1.0E-15,
                                 expansion: int = 30,
-                                spec_lim: Optional[List[float]] = None
+                                spec_lim: Optional[List[float]] = None,
+                                verbose=False
                                ) -> 'Wavefunction':
         """Perform the exponentiation of fermionic algebras to the
         wavefunction according the method and accuracy.
@@ -531,6 +532,8 @@ class Wavefunction:
 
             spec_lim (List[float]): spectral range of the Hamiltonian, the length of \
                 the list should be 2. Optional.
+
+            verbose (bool): print the convergence of the Taylor expansion
 
         Returns:
             newwfn (Wavefunction): a new initialized wavefunction object
@@ -554,14 +557,15 @@ class Wavefunction:
         max_expansion = expansion
 
         if algo == 'taylor':
-            ham_arrays = hamil.iht(time)
-
+            ham_arrays = hamil.iht(1.)
             time_evol = copy.deepcopy(base)
             work = copy.deepcopy(base)
             for order in range(1, max_expansion):
                 work = work.apply(ham_arrays)
-                coeff = 1.0 / factorial(order)
+                coeff = time**order / factorial(order, exact=True)
                 time_evol.ax_plus_y(coeff, work)
+                if verbose:
+                    print(f"{order=}", f"{(work.norm() * numpy.abs(coeff))=}", f"{accuracy=}", f"{time_evol.norm()=}")
                 if work.norm() * numpy.abs(coeff) < accuracy:
                     break
             else:
